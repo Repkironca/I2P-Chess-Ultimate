@@ -19,7 +19,7 @@ static int custom_evaluate(State* state, bool use_mobility = true) {
     int self_kr = -1, self_kc = -1;
     int oppn_kr = -1, oppn_kc = -1;
 
-    // 找國王找國王找國王
+    // 1. 快速尋找雙方國王 (供 V2 曼哈頓距離使用)
     for (int r = 0; r < BOARD_H; r++) {
         for (int c = 0; c < BOARD_W; c++) {
             if (self_board[r][c] == 6) { self_kr = r; self_kc = c; }
@@ -27,62 +27,75 @@ static int custom_evaluate(State* state, bool use_mobility = true) {
         }
     }
 
-    // 找曼哈頓距離
     auto manhattan = [](int r1, int c1, int r2, int c2) {
         return std::abs(r1 - r2) + std::abs(c1 - c2);
     };
 
-    // 靜態區，考慮 PST、曼哈頓、升變、御駕親征
+    // V6 所需：步數保護機制 (防呆，避免異常值導致權重爆炸)
+    int safe_step = state->step;
+    if (safe_step < 0 || safe_step > 300) safe_step = 20;
+
+    // 2. 靜態區，嚴格對齊公式：V1, V2, V3, V5, V6
     for (int r = 0; r < BOARD_H; r++) {
         for (int c = 0; c < BOARD_W; c++) {
+            
+            // --- 幫我方計算 ---
             int sp = self_board[r][c];
             if (sp > 0) {
-                // 黑白轉換，黑棋要變白棋視角
+                // 視角正規化
                 int pr = (state->player == 0) ? r : (BOARD_H - 1 - r);
-                
-                // V3: PST 權重
-                self_score += PIECE_VALUES[sp] + u3[sp][pr * BOARD_W + c];
+                int idx = pr * BOARD_W + c;
 
-                // V2: 曼哈頓距離權重
+                // [公式 V1]: 各種棋子數量差 (獨立計算 Piece Value)
+                self_score += PIECE_VALUES[sp];
+                
+                // [公式 V3]: 各種棋子的位置 (純 PST)
+                self_score += u3[sp][idx];
+
+                // [公式 V2]: 與敵方國王的曼哈頓距離 (國王 sp=6 本身不計算追殺)
                 if (sp < 6 && oppn_kr != -1) {
                     int dist = manhattan(r, c, oppn_kr, oppn_kc);
                     self_score += u2[sp - 1] * dist; 
                 }
 
-                // V5: 小兵升變懲罰
+                // [公式 V5]: 漸進式升變指數 (剩 1~4 步)
                 if (sp == 1 && pr >= 1 && pr <= 4) {
                     self_score += u5_pawn_stages[pr - 1];
                 }
 
-                // V7: 國王御駕親征的壓力
+                // [公式 V6]: 當前步數 * 國王位置權重 (御駕親征)
                 if (sp == 6) {
-                    self_score += u7_king_step[pr * BOARD_W + c];
+                    self_score += u7_king_step[idx] * safe_step;
                 }
             }
             
-            // 這邊是幫對手計算
+            // --- 幫敵方計算 (維持對稱性) ---
             int op = oppn_board[r][c];
             if (op > 0) {
-                // 對手視角的相對列
+                // 視角正規化 (敵方的底線是他的 0)
                 int opr = (state->player == 1) ? r : (BOARD_H - 1 - r);
+                int idx = opr * BOARD_W + c;
                 
-                // V3: PST
-                oppn_score += PIECE_VALUES[op] + u3[op][opr * BOARD_W + c];
+                // [公式 V1]
+                oppn_score += PIECE_VALUES[op];
 
-                // V2: 曼哈頓距離
+                // [公式 V3]
+                oppn_score += u3[op][idx];
+
+                // [公式 V2]
                 if (op < 6 && self_kr != -1) {
                     int dist = manhattan(r, c, self_kr, self_kc);
                     oppn_score += u2[op - 1] * dist;
                 }
 
-                // V5: 小兵升變懲罰
+                // [公式 V5]
                 if (op == 1 && opr >= 1 && opr <= 4) {
                     oppn_score += u5_pawn_stages[opr - 1];
                 }
 
-                // V7: 國王御駕親征的壓力
+                // [公式 V6]
                 if (op == 6) {
-                    oppn_score += u7_king_step[opr * BOARD_W + c];
+                    oppn_score += u7_king_step[idx] * safe_step;
                 }
             }
         }
@@ -90,37 +103,49 @@ static int custom_evaluate(State* state, bool use_mobility = true) {
 
     int dynamic = 0;
 
-    // 3. 動態探索：考慮吃子威脅與機動力
+    // 3. 動態探索區：對齊公式中的 V4 與 k1
     if (use_mobility) {
+        // 確保己方合法步生成完畢 (防呆)
+        if (state->legal_actions.empty() && state->game_state == UNKNOWN) {
+            state->get_legal_actions();
+        }
+
         int self_mobility = state->legal_actions.size();
         int self_tactical = 0;
+        
+        // 掃描我方可以吃誰
         for (const auto& action : state->legal_actions) {
             int tr = action.second.first % BOARD_H;
             int tc = action.second.second;
-            int victim = oppn_board[tr][tc]; // 目標格上的敵子
+            int victim = oppn_board[tr][tc]; // 我方目標格上的敵子
             if (victim > 0) {
                 self_tactical += u4_tactical[victim - 1];
             }
         }
         
-        // 算敵方的
+        // 生成敵方的盤面來算他們的機動力與戰術威脅
         State opp_state(state->board, 1 - state->player);
         opp_state.get_legal_actions();
         int oppn_mobility = opp_state.legal_actions.size();
         int oppn_tactical = 0;
+        
+        // 掃描敵方可以吃誰
         for (const auto& action : opp_state.legal_actions) {
             int tr = action.second.first % BOARD_H;
             int tc = action.second.second;
-            int victim = oppn_board[tr][tc]; // 目標格上的我子
+            int victim = self_board[tr][tc];
             if (victim > 0) {
-                oppn_tactical += u4_tactical[victim - 1]; // V4
+                oppn_tactical += u4_tactical[victim - 1]; 
             }
         }
 
+        // [公式 V4]: 下一手吃子的步數權重差
         dynamic += (self_tactical - oppn_tactical);
+        // [公式 k1]: 合法步數量差 (機動力)
         dynamic += u6_mobility * (self_mobility - oppn_mobility);
     }
 
+    // 結算：基礎常數 + 靜態雙方差距 + 動態威脅差距
     return u_intercept + (self_score - oppn_score) + dynamic;
 }
 
