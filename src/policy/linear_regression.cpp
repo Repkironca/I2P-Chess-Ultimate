@@ -3,13 +3,13 @@
 #include <utility>
 
 #include "state.hpp"
-#include "duckyQuack.hpp"
+#include "linear_regression.hpp"
 
-namespace DuckyQuack {
+namespace lg {
 
 // *=============================================*
 // State，嗯笑死我沒有要用你寫的唷，而且我還塞在同一份檔案
-static int custom_evaluate(State* state, bool use_dyna = true) {
+static int custom_evaluate(State* state, bool use_mobility = true) {
     if (state->game_state == WIN) return -P_MAX;
 
     auto self_board = state->board.board[state->player];
@@ -104,12 +104,13 @@ static int custom_evaluate(State* state, bool use_dyna = true) {
     int dynamic = 0;
 
     // 3. 動態探索區：對齊公式中的 V4 與 k1
-    if (use_dyna) {
+    if (use_mobility) {
         // 確保己方合法步生成完畢 (防呆)
         if (state->legal_actions.empty() && state->game_state == UNKNOWN) {
             state->get_legal_actions();
         }
 
+        int self_mobility = state->legal_actions.size();
         int self_tactical = 0;
         
         // 掃描我方可以吃誰
@@ -125,6 +126,7 @@ static int custom_evaluate(State* state, bool use_dyna = true) {
         // 生成敵方的盤面來算他們的機動力與戰術威脅
         State opp_state(state->board, 1 - state->player);
         opp_state.get_legal_actions();
+        int oppn_mobility = opp_state.legal_actions.size();
         int oppn_tactical = 0;
         
         // 掃描敵方可以吃誰
@@ -139,6 +141,8 @@ static int custom_evaluate(State* state, bool use_dyna = true) {
 
         // [公式 V4]: 下一手吃子的步數權重差
         dynamic += (self_tactical - oppn_tactical);
+        // [公式 k1]: 合法步數量差 (機動力)
+        dynamic += u6_mobility * (self_mobility - oppn_mobility);
     }
 
     // 結算：基礎常數 + 靜態雙方差距 + 動態威脅差距
@@ -311,22 +315,6 @@ int Policy::eval_ctx(State *state, int depth, GameHistory& history, int ply, Sea
     if(state->legal_actions.empty() && state->game_state == UNKNOWN) state->get_legal_actions();
     if(state->game_state == WIN) return P_MAX - ply; 
     if(state->game_state == DRAW) return 0;
-
-
-    // 不是葉節點，且深度夠淺 (通常 RFP 只對剩餘深度 3 以內的分支有效)
-    if (depth <= 3 && depth > 0) {
-        
-        // 計算當下的靜態盤面分數
-        int static_eval = custom_evaluate(state); 
-        
-        // 設定容錯值 (Margin)：每深 1 層，給予約 1 顆小兵的容錯空間
-        int margin = 1.2 * PIECE_VALUES[1] * depth; 
-
-        // 如果我方優勢大到「即使少走一步 (減去 margin)，對手依然無法打破 beta 邊界」
-        if (static_eval - margin >= beta) {
-            return static_eval; // 霸道剪枝：直接退回靜態分數，省下後續所有 legal_actions 展開與遞迴！
-        }
-    }
 
     int rep_score;
     if(state->check_repetition(history, rep_score)) return rep_score;
@@ -530,4 +518,4 @@ std::vector<ParamDef> Policy::param_defs(){
     };
 }
 
-} // namespace DuckyQuack
+} // namespace

@@ -15,6 +15,8 @@
 #include "game_history.hpp"
 #include "random.hpp"
 #include "duckyQuack.hpp"
+#include "linear_regression.hpp"
+#include "logisticRegression.hpp"
 
 struct AlgoEntry {
     std::string name;
@@ -39,6 +41,22 @@ inline const std::vector<AlgoEntry>& get_algo_table(){
             DuckyQuack::Policy::param_defs(),
             [](State* s, int d, GameHistory& h, SearchContext& c){
                 return DuckyQuack::Policy::search(s, d, h, c);
+            }
+        },
+        {
+            "linear_regression", 
+            lg::Policy::default_params(),
+            lg::Policy::param_defs(),
+            [](State* s, int d, GameHistory& h, SearchContext& c){
+                return lg::Policy::search(s, d, h, c);
+            }
+        },
+        {
+            "logistic_regression", 
+            Logistic::Policy::default_params(),
+            Logistic::Policy::param_defs(),
+            [](State* s, int d, GameHistory& h, SearchContext& c){
+                return Logistic::Policy::search(s, d, h, c);
             }
         },
     };
