@@ -1,0 +1,57 @@
+#pragma once
+/*============================================================
+ * Algorithm Registry
+ *
+ * Each algorithm defines:
+ *   - search() function
+ *   - default_params() returning ParamMap
+ *   - param_defs() for UCI option advertisement
+ *============================================================*/
+
+#include <string>
+#include <functional>
+#include <vector>
+#include "search_types.hpp"
+#include "game_history.hpp"
+#include "random.hpp"
+#include "duckyQuack.hpp"
+
+struct AlgoEntry {
+    std::string name;
+    ParamMap default_params;
+    std::vector<ParamDef> param_defs;
+    std::function<SearchResult(State*, int, GameHistory&, SearchContext&)> search;
+};
+
+inline const std::vector<AlgoEntry>& get_algo_table(){
+    static const std::vector<AlgoEntry> table = {
+        {
+            "random",
+            Random::default_params(),
+            Random::param_defs(),
+            [](State* s, int d, GameHistory& h, SearchContext& c){
+                return Random::search(s, d, h, c);
+            }
+        },
+        {
+            "duckyQuack", 
+            DuckyQuack::Policy::default_params(),
+            DuckyQuack::Policy::param_defs(),
+            [](State* s, int d, GameHistory& h, SearchContext& c){
+                return DuckyQuack::Policy::search(s, d, h, c);
+            }
+        },
+    };
+    return table;
+}
+
+inline const AlgoEntry* find_algo(const std::string& name){
+    for(auto& entry : get_algo_table()){
+        if(entry.name == name){
+            return &entry;
+        }
+    }
+    return nullptr;
+}
+
+inline std::string default_algo_name(){ return "duckyQuack"; }
