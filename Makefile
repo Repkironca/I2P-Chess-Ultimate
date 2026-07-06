@@ -12,7 +12,7 @@ TEST_SRCS = unittest/state_test.cpp
 all: minichess benchmark state_test
 
 minichess:
-	$(CXX) $(CXXFLAGS) -o build/minichess-ubgi $(GAME_SRCS) $(POLICY_SRCS) $(UBGI_SRCS)
+	$(CXX) $(CXXFLAGS) -o build/Repkironca $(GAME_SRCS) $(POLICY_SRCS) $(UBGI_SRCS)
 
 benchmark:
 	$(CXX) $(CXXFLAGS) -o build/minichess-benchmark $(GAME_SRCS) $(POLICY_SRCS) $(BENCH_SRCS)
@@ -22,6 +22,6 @@ state_test:
 
 # Windows 安全版 clean：只刪除自己編譯出來的目標檔案，不動 TA 的 baseline
 clean:
-	-del /Q /F build\minichess-ubgi.exe 2>nul
+	-del /Q /F build\duckyQuack.exe 2>nul
 	-del /Q /F build\minichess-benchmark.exe 2>nul
 	-del /Q /F unittest\build\state_test.exe 2>nul

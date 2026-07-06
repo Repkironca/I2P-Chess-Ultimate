@@ -1,0 +1,20 @@
+執行檔名稱                     | 預設演算法                | 所有可用演算法
+--------------------------------------------------------------------------------
+hikkiman.exe              | minimax              | minimax, random
+Jasonhmlt.exe             | minimax              | minimax, random
+minichess-ubgi.exe        | duckyQuack           | random, duckyQuack, linear_regression, logistic_regression
+starynn.exe               | submission              | minimax, random, submission, alphabeta, pvs
+TheLeafInSunny.exe        | pvs                  | minimax, alphabeta, pvs, random
+張原甄.exe                   | minimax              | minimax, random
+張宗文.exe                   | minimax              | minimax, pvs, random
+沈言.exe                    | minimax              | minimax, alphabeta, pvs, random
+蔡念慈.exe                   | pvs                  | minimax, random, alpha_beta, pvs
+蔡昕翰.exe                   | minimax              | minimax, random, submission
+蘇晏平.exe                   | 114062331_submission | 114062331_submission, minimax, random
+賴柏睿.exe                   | minimax              | minimax, pvs, random
+鄭凱文.exe                   | submission           | submission, minimax, random
+陳孜博.exe                   | submission           | minimax, random, alpha-beta, pvs, quiescence, submission
+陳敬丰.exe                   | submission           | minimax, random, submission
+高全懋.exe                   | minimax              | minimax, random
+黃妍蓉.exe                   | pvs                  | minimax, alphabeta, pvs, quiescence, random
+黃宇希.exe                   | submission           | submission, pvs, alphabeta, minimax, random

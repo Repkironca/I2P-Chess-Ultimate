@@ -681,8 +681,9 @@ def discover_engines(build_dir):
                 full = os.path.join(scan_dir, entry)
                 if os.path.isfile(full):
                     name = os.path.splitext(entry)[0]
-                    if "uci" in name.lower() or "ubgi" in name.lower():
-                        results.append((name, full))
+                    # if "uci" in name.lower() or "ubgi" in name.lower():
+                    # 靠邀你只要是個 .exe 就推，問題不要那麼多
+                    results.append((name, full))
         except OSError:
             continue
 

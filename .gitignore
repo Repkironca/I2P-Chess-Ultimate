@@ -1,6 +1,5 @@
 .vscode/
 .claude/
-build/
 *models/
 ~$*
 *.bin
@@ -17,7 +16,6 @@ __pycache__/
 
 # Distribution / packaging
 .Python
-build/
 develop-eggs/
 dist/
 downloads/
@@ -231,6 +229,9 @@ gamelog.txt
 temp/
 wandb/
 lightning_logs/
-*.exe
 *.png
 REQUIREMENTS.md
+
+# 這些每次都會改所以不要丟 .git
+build/Repkironca.exe
+build/minichess-benchmark.exe
