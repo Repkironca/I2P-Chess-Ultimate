@@ -235,3 +235,5 @@ REQUIREMENTS.md
 # 這些每次都會改所以不要丟 .git
 build/Repkironca.exe
 build/minichess-benchmark.exe
+arena_tasks.json
+*.log
