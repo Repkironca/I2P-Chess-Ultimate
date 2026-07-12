@@ -237,3 +237,4 @@ build/Repkironca.exe
 build/minichess-benchmark.exe
 arena_tasks.json
 *.log
+*.json

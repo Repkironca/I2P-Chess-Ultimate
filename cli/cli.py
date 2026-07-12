@@ -4,6 +4,7 @@ import argparse
 import os
 import sys
 import threading
+import random
 
 from cli.games.minichess import get_context as _minichess_ctx
 from gui.ubgi_client import UBGIEngine
@@ -31,7 +32,6 @@ def format_search_info(info: dict | None) -> str:
     if not info: return ""
     parts: list[str] = []
     
-    # [修復] 移除 seldepth 顯示，讓畫面乾淨，符合 GUI 顯示習慣
     depth = info.get("depth")
     if depth is not None:
         parts.append(f"depth={depth}")
@@ -39,6 +39,7 @@ def format_search_info(info: dict | None) -> str:
     score_cp = info.get("score_cp")
     if score_cp is not None: parts.append(f"score={score_cp / 100.0:+.2f}")
     elif info.get("score_mate") is not None: parts.append(f"mate={info['score_mate']}")
+    if info.get("string") == "Random Opening": parts.append("Random Opening")
     return ", ".join(parts)
 
 def format_move_display(move_or_uci, state=None) -> str:
@@ -77,6 +78,7 @@ def run_game(
     white_path: str, black_path: str, time_limit: int, white_algo: str, black_algo: str,
     verbose: bool = True, show_board: bool = True, game_num: int | None = None, total_games: int | None = None,
     depth: int = 0, params: list[str] | None = None, white_params: list[str] | None = None, black_params: list[str] | None = None,
+    random_open: str = "0"
 ) -> str:
     game_name = _game_ctx.get("name", "generic")
     has_state = game_name != "generic"
@@ -84,12 +86,23 @@ def run_game(
     move_number = 0
     state = _init_game_state(game_name)
 
+    # 處理隨機開局步數解析
+    k_limit = 0
+    if random_open:
+        if "-" in random_open:
+            try:
+                low, high = map(int, random_open.split("-"))
+                k_limit = random.randint(low, high)
+            except ValueError: pass
+        elif random_open.isdigit():
+            k_limit = int(random_open)
+
     if verbose:
         print(f"=== {'Game ' + str(game_num) + '/' + str(total_games) if game_num else 'New Game'} ===", flush=True)
         print(f"  White: {'Human' if white_path == 'human' else white_algo}", flush=True)
         print(f"  Black: {'Human' if black_path == 'human' else black_algo}", flush=True)
         print(f"  Time limit: {time_limit}ms per move", flush=True)
-        # [修復] 控制是否印出棋盤
+        if k_limit > 0: print(f"  Random Opening: First {k_limit} moves", flush=True)
         if has_state and show_board: print_board(state)
 
     w_eng, b_eng = None, None
@@ -124,27 +137,34 @@ def run_game(
             if (white_path if is_white else black_path) == "human":
                 bestmove_uci = input(f"  {side_name}'s turn. Enter move: ").strip()
             else:
-                active_eng = w_eng if is_white else b_eng
-                active_eng.set_position(moves=uci_moves)
-
-                done_event = threading.Event()
-                move_res, last_info = {}, {}
-
-                def info_cb(inf): 
-                    if 'depth' in inf: last_info.update(inf)
-                def done_cb(bm): 
-                    move_res['bm'] = bm; done_event.set()
-
-                if depth > 0:
-                    active_eng.go(depth=depth, info_callback=info_cb, done_callback=done_cb)
-                    done_event.wait()
+                # 【新增】隨機開局攔截
+                if len(uci_moves) < k_limit and has_state and state.legal_actions:
+                    random_move = random.choice(state.legal_actions)
+                    bestmove_uci = _game_ctx["move_to_uci"](random_move)
+                    info = {"depth": 0, "score_cp": 0, "string": "Random Opening"}
+                    time.sleep(0.01) # 微小延遲，避免瞬間印完
                 else:
-                    active_eng.go(movetime=time_limit, info_callback=info_cb, done_callback=done_cb)
-                    if not done_event.wait(timeout=(time_limit / 1000.0) + 30.0):
-                        active_eng.stop_and_wait(timeout=2.0)
+                    active_eng = w_eng if is_white else b_eng
+                    active_eng.set_position(moves=uci_moves)
 
-                bestmove_uci = move_res.get('bm')
-                info = last_info
+                    done_event = threading.Event()
+                    move_res, last_info = {}, {}
+
+                    def info_cb(inf): 
+                        if 'depth' in inf: last_info.update(inf)
+                    def done_cb(bm): 
+                        move_res['bm'] = bm; done_event.set()
+
+                    if depth > 0:
+                        active_eng.go(depth=depth, info_callback=info_cb, done_callback=done_cb)
+                        done_event.wait()
+                    else:
+                        active_eng.go(movetime=time_limit, info_callback=info_cb, done_callback=done_cb)
+                        if not done_event.wait(timeout=(time_limit / 1000.0) + 30.0):
+                            active_eng.stop_and_wait(timeout=2.0)
+
+                    bestmove_uci = move_res.get('bm')
+                    info = last_info
 
             if not bestmove_uci or bestmove_uci in ("none", "(none)", "0000"):
                 if verbose: print(f"  >> {side_name} engine failed to return a move! {side_name} loses.", flush=True)
@@ -161,36 +181,14 @@ def run_game(
                 apply_fn = _game_ctx.get("apply_move")
                 if apply_fn is not None:
                     state, _ = apply_fn(state, bestmove_uci, _game_ctx)
-            # [修復] 控制是否印出棋盤
             if verbose and has_state and show_board: print_board(state)
 
     finally:
         if w_eng: w_eng.quit()
         if b_eng: b_eng.quit()
 
-def run_tournament(
-    engine1_path: str, engine2_path: str, time_limit: int, algo1: str, algo2: str,
-    num_games: int, verbose: bool, show_board: bool = True, depth: int = 0, params: list[str] | None = None,
-    engine1_params: list[str] | None = None, engine2_params: list[str] | None = None,
-) -> None:
-    e1_wins, e2_wins, draws = 0, 0, 0
-    try:
-        for i in range(num_games):
-            e1_white = (i % 2 == 0)
-            w_path, w_algo = (engine1_path, algo1) if e1_white else (engine2_path, algo2)
-            b_path, b_algo = (engine2_path, algo2) if e1_white else (engine1_path, algo1)
-            
-            res = run_game(
-                w_path, b_path, time_limit, w_algo, b_algo, verbose, show_board, i + 1, num_games, depth, params,
-                engine1_params if e1_white else engine2_params, engine2_params if e1_white else engine1_params
-            )
-            
-            if res == "white": e1_wins += 1 if e1_white else 0; e2_wins += 1 if not e1_white else 0
-            elif res == "black": e2_wins += 1 if e1_white else 0; e1_wins += 1 if not e1_white else 0
-            else: draws += 1
-            print(f"  Score: E1({algo1}) +{e1_wins} -{e2_wins} ={draws}", flush=True)
-    except KeyboardInterrupt:
-        print("\nTournament interrupted!", flush=True)
+def run_tournament(*args, **kwargs):
+    pass 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
@@ -203,15 +201,16 @@ def main() -> None:
     parser.add_argument("--black-algo", default="minimax")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--quiet", action="store_true")
-    parser.add_argument("--no-board", action="store_true") # [新增] 禁用終端機畫圖
+    parser.add_argument("--no-board", action="store_true") 
     parser.add_argument("--depth", type=int, default=0)
+    parser.add_argument("--random-open", type=str, default="0") # [新增] 接收隨機開局參數
     parser.add_argument("--param", action="append", default=[])
     parser.add_argument("--white-param", action="append", default=[])
     parser.add_argument("--black-param", action="append", default=[])
     args = parser.parse_args()
 
     _init_game(args.game.lower())
-    verbose = False if args.quiet else (args.verbose if args.verbose is not None else args.games == 1)
+    verbose = False if args.quiet else (True if args.verbose or args.games == 1 else False)
     show_board = not args.no_board
 
     if args.games > 1:
@@ -219,12 +218,13 @@ def main() -> None:
         return
 
     try:
-        result = run_game(args.white, args.black, args.time, args.white_algo, args.black_algo, verbose, show_board, depth=args.depth, params=args.param, white_params=args.white_param, black_params=args.black_param)
-        
-        # [修復] 移除愚蠢的死字串，正確解析變數
+        result = run_game(
+            args.white, args.black, args.time, args.white_algo, args.black_algo, 
+            verbose, show_board, depth=args.depth, params=args.param, white_params=args.white_param, black_params=args.black_param,
+            random_open=args.random_open
+        )
         res_map = {'white': '1-0', 'black': '0-1', 'draw': '1/2-1/2'}
         print(f"Result: {res_map.get(result, '1/2-1/2')}", flush=True)
-        
     except KeyboardInterrupt:
         print("\nGame aborted.", flush=True)
 

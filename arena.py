@@ -73,15 +73,15 @@ def play_game(white, black, models, settings, counter, logger):
     w_algo = models.get(white, "minimax")
     b_algo = models.get(black, "minimax")
 
-    # [修復] 加上 --verbose 抓取 Moves，加上 --no-board 拒絕垃圾符號
     cmd = [
         sys.executable, "-u", "-m", "cli.cli",
         "--white", w_path,
         "--black", b_path,
-        "--time", str(settings['time']),
+        "--time", str(settings.get('time', 2000)),
         "--games", "1",
         "--verbose",
         "--no-board",
+        "--random-open", str(settings.get('rand_open', '0')), # 傳入隨機開局參數
         "--white-algo", w_algo,
         "--black-algo", b_algo
     ]
@@ -98,8 +98,15 @@ def play_game(white, black, models, settings, counter, logger):
         for line in proc.stdout:
             line = line.strip()
             if not line: continue
+
+            if any(err_word in line for err_word in ["Traceback", "SyntaxError", "Exception", "Error:"]):
+                logger.write(f"  [系統報錯] {line}\n")
+                continue
             
-            if "White:" in line or "Black:" in line or "Result:" in line or "===" in line or "Score after" in line or "wins!" in line or "Draw" in line:
+            if any(char in line for char in ["♔", "♕", "♖", "♗", "♘", "♙", "♚", "♛", "♜", "♝", "♞", "♟", "─", "│", "┌", "┐", "└", "┘", "├", "┤", "┬", "┴", "┼"]):
+                continue
+
+            if "White:" in line or "Black:" in line or "Result:" in line or "===" in line or "Score after" in line or "wins!" in line or "Draw" in line or "Random Opening" in line:
                 logger.write(f"  {line}\n")
 
             if ("White:" in line or "Black:" in line) and ("." in line):
@@ -121,7 +128,6 @@ def play_game(white, black, models, settings, counter, logger):
                 if res_str == "1-0": winner = "white"
                 elif res_str == "0-1": winner = "black"
                 elif res_str == "1/2-1/2": winner = "draw"
-            # [修復] 防呆備用：若 Result 抓不到，直接從終局宣言抓勝負
             elif ">> White wins!" in line or ">> Sente wins!" in line:
                 winner = "white"
             elif ">> Black wins!" in line or ">> Gote wins!" in line:
@@ -193,6 +199,8 @@ def run_elimination(participants, models, settings, elim_settings, counter, logg
         if len(active) <= 1: break
             
         logger.write(f"\n--- 🏆 淘汰賽 第 {round_num} 輪 ---\n")
+        
+        # 確保同敗場數者的配對是完全隨機的
         random.shuffle(active)
         active.sort(key=lambda x: losses[x]) 
         matches = [(active[i], active[i+1]) for i in range(0, len(active)-1, 2)]
@@ -203,6 +211,16 @@ def run_elimination(participants, models, settings, elim_settings, counter, logg
             elif winner == p1: losses[p2] += 1
             elif winner == p2: losses[p1] += 1
             else: losses[p1] += 1; losses[p2] += 1
+        
+        # 【新增】每一輪結束，完整輸出晉級與淘汰名單
+        advanced = [p for p in active if losses[p] < (2 if is_double else 1)]
+        eliminated = [p for p in active if losses[p] >= (2 if is_double else 1)]
+        
+        logger.write(f"\n  [第 {round_num} 輪 結算]\n")
+        logger.write(f"  ✨ 晉級名單 ({len(advanced)}人): {', '.join(advanced)}\n")
+        if eliminated:
+            logger.write(f"  💀 淘汰名單 ({len(eliminated)}人): {', '.join(eliminated)}\n")
+            
         round_num += 1
         
     champion = [p for p, l in losses.items() if l < (2 if is_double else 1)]
@@ -272,24 +290,31 @@ def main():
         if choice == '1':
             k = get_input("  每組對手互相對戰次數 (K)? ", cast_type=int, min_val=1)
             swap = get_yes_no("  是否交換黑白重賽?")
+            rand_open = get_input("  ➤ 隨機開局步數 (例如 '3' 或區間 '1-3'，輸入 '0' 關閉)? ", cast_type=str)
+            
             matches = []
             for w, b in itertools.combinations(list(models.keys()), 2):
                 for _ in range(k): matches.append((w, b))
                 if swap:
                     for _ in range(k): matches.append((b, w))
             task_data.update({"mode": "round_robin", "matches": matches})
+            task_data["settings"]["rand_open"] = rand_open
             
         elif choice == '2':
             is_double = get_yes_no("  是否採用雙敗淘汰制?")
             bo_x = get_input("  每場採幾戰幾勝 (BoX)? ", cast_type=int, min_val=1)
             rand_first = get_yes_no("  隨機先後手?")
+            rand_open = get_input("  ➤ 隨機開局步數 (例如 '3' 或區間 '1-3'，輸入 '0' 關閉)? ", cast_type=str)
+            
             task_data.update({
                 "mode": "elimination", "participants": list(models.keys()),
                 "elim_settings": {"double_elim": is_double, "bo_x": bo_x, "rand_first": rand_first}
             })
+            task_data["settings"]["rand_open"] = rand_open
             
         elif choice == '3':
             custom_matches = []
+            rand_open = get_input("  ➤ 隨機開局步數 (例如 '3' 或區間 '1-3'，輸入 '0' 關閉)? ", cast_type=str)
             while True:
                 cmd = input("  ➤ 輸入 (白方 黑方 局數 是否交換[y/n]) 或 'done': ").strip()
                 if cmd.lower() == 'done': break
@@ -298,9 +323,18 @@ def main():
                     continue
                 parts = cmd.split()
                 if len(parts) == 4 and parts[0] in models and parts[1] in models:
-                    custom_matches.append({"w": parts[0], "b": parts[1], "k": int(parts[2]), "swap": parts[3].lower() in ['y', 'yes']})
+                    try:
+                        k_val = int(parts[2])
+                        swap_val = parts[3].lower() in ['y', 'yes', 'true']
+                        custom_matches.append({"w": parts[0], "b": parts[1], "k": k_val, "swap": swap_val})
+                        print(f"  ➕ 已加入: {parts[0]} vs {parts[1]}")
+                    except ValueError:
+                        print("  ⚠️ 格式錯誤！局數必須是數字。請重新輸入。")
+                else:
+                    print("  ⚠️ 參數錯誤或找不到模型，請重新輸入。")
             if not custom_matches: continue
             task_data.update({"mode": "custom", "matches": custom_matches})
+            task_data["settings"]["rand_open"] = rand_open
             
         is_unstop = get_yes_no("\n🚀 是否開啟 Unstop 模式?")
         with open(TASK_FILE, 'w', encoding='utf-8') as f:
