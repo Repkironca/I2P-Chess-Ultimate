@@ -5,6 +5,7 @@ import os
 import sys
 import threading
 import random
+import time
 
 from cli.games.minichess import get_context as _minichess_ctx
 from gui.ubgi_client import UBGIEngine
@@ -86,7 +87,6 @@ def run_game(
     move_number = 0
     state = _init_game_state(game_name)
 
-    # 處理隨機開局步數解析
     k_limit = 0
     if random_open:
         if "-" in random_open:
@@ -137,12 +137,10 @@ def run_game(
             if (white_path if is_white else black_path) == "human":
                 bestmove_uci = input(f"  {side_name}'s turn. Enter move: ").strip()
             else:
-                # 【新增】隨機開局攔截
                 if len(uci_moves) < k_limit and has_state and state.legal_actions:
                     random_move = random.choice(state.legal_actions)
                     bestmove_uci = _game_ctx["move_to_uci"](random_move)
                     info = {"depth": 0, "score_cp": 0, "string": "Random Opening"}
-                    time.sleep(0.01) # 微小延遲，避免瞬間印完
                 else:
                     active_eng = w_eng if is_white else b_eng
                     active_eng.set_position(moves=uci_moves)
@@ -160,7 +158,11 @@ def run_game(
                         done_event.wait()
                     else:
                         active_eng.go(movetime=time_limit, info_callback=info_cb, done_callback=done_cb)
-                        if not done_event.wait(timeout=(time_limit / 1000.0) + 30.0):
+                        
+                        # 模板控管時間：精準等待 2000ms (加上 0.05 秒系統排程誤差寬容)
+                        is_done = done_event.wait(timeout=(time_limit / 1000.0) + 0.05)
+                        
+                        if not is_done:
                             active_eng.stop_and_wait(timeout=2.0)
 
                     bestmove_uci = move_res.get('bm')
@@ -203,7 +205,7 @@ def main() -> None:
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--no-board", action="store_true") 
     parser.add_argument("--depth", type=int, default=0)
-    parser.add_argument("--random-open", type=str, default="0") # [新增] 接收隨機開局參數
+    parser.add_argument("--random-open", type=str, default="0")
     parser.add_argument("--param", action="append", default=[])
     parser.add_argument("--white-param", action="append", default=[])
     parser.add_argument("--black-param", action="append", default=[])
