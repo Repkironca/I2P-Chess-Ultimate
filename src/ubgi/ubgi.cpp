@@ -17,9 +17,7 @@
 
 namespace ubgi {
 
-
 /* === Global State === */
-
 static Board              g_board;
 static int                g_player = 0;
 static int                g_step   = 0;
@@ -32,31 +30,30 @@ static std::mutex         g_io_mutex;
 static std::atomic<bool>  g_searching{false};
 static std::atomic<bool>  g_bestmove_sent{true};
 static Move               g_best_move;
+static std::mutex         g_bestmove_mutex;
 static int                g_multi_pv = 1;
 
+// 安全管理標記：如果由外部 CLI 判定為耳聾演算法，將會被設為 true
+static bool               g_safe_time = false; 
+
+// 絕對安全的指標與 Mutex，用於 cmd_stop 瞬間中斷深入遞迴中的演算法
+static SearchContext*     g_active_ctx_ptr = nullptr;
+static std::mutex         g_active_ctx_mutex;
 
 /* === Helpers === */
-
 static void send(const std::string& msg){
     std::lock_guard<std::mutex> lock(g_io_mutex);
     std::cout << msg << std::endl;
 }
 
-
 /* === Move Conversion === */
-
-/* DROP_LETTERS is defined per-game in config.hpp for games with drops.
- * Maps hand piece index (1..NUM_HAND_TYPES) to a letter for UBGI protocol.
- * E.g. MiniShogi: " PSGBR", Kohaku Shogi: " PSGLNBR".
- * Games without drops don't define it — provide a fallback. */
 #if NUM_HAND_TYPES == 0
 static const char DROP_LETTERS[] = " ";
 #endif
 
 static int drop_letter_to_type(char ch){
-    /* Search DROP_LETTERS for the character */
     for(int i = 1; i <= NUM_HAND_TYPES; i++){
-        if(DROP_LETTERS[i] == ch
+        if(DROP_LETTERS[i] == ch 
            || DROP_LETTERS[i] == (ch >= 'a' ? ch - 32 : ch + 32)){
             return i;
         }
@@ -64,7 +61,6 @@ static int drop_letter_to_type(char ch){
     return 0;
 }
 
-/* Helper: encode a square as column letter + row number string (e.g. "a15") */
 static std::string sq_to_str(size_t row, size_t col){
     std::string s;
     s += static_cast<char>('a' + col);
@@ -73,11 +69,9 @@ static std::string sq_to_str(size_t row, size_t col){
 }
 
 std::string move_to_str(const Move& m){
-    /* Placement move: from == to → output just the destination */
     if(m.first == m.second){
         return sq_to_str(m.second.first, m.second.second);
     }
-    /* Drop move: from.first == BOARD_H, from.second == piece_type */
     if(m.first.first == static_cast<size_t>(BOARD_H)){
         int pt = static_cast<int>(m.first.second);
         std::string s;
@@ -86,11 +80,9 @@ std::string move_to_str(const Move& m){
         s += sq_to_str(m.second.first, m.second.second);
         return s;
     }
-    /* Board move: from + to (+ promotion if to.first >= BOARD_H) */
     bool promote = (m.second.first >= static_cast<size_t>(BOARD_H));
     if(promote){
 #if NUM_HAND_TYPES > 0
-        /* Shogi-style promotion: to.first = actual_row + BOARD_H */
         size_t to_row = m.second.first - BOARD_H;
         std::string s = (
             sq_to_str(m.first.first, m.first.second)
@@ -99,8 +91,6 @@ std::string move_to_str(const Move& m){
         s += '+';
         return s;
 #else
-        /* Chess-style promotion: to.first = actual_row + BOARD_H * promo_idx
-         * promo_idx: 1=Queen, 2=Rook, 3=Bishop, 4=Knight */
         int promo_idx = static_cast<int>(m.second.first / BOARD_H);
         size_t to_row = m.second.first % BOARD_H;
         std::string s = (
@@ -121,13 +111,9 @@ std::string move_to_str(const Move& m){
     return s;
 }
 
-/* Helper: parse a square from a string starting at position pos.
- * Returns (row, col) and advances pos past the consumed characters.
- * Format: column letter + row number (possibly multi-digit), e.g. "a15". */
 static std::pair<size_t, size_t> parse_sq(const std::string& s, size_t& pos){
     size_t col = static_cast<size_t>(s[pos] - 'a');
     pos++;
-    /* Parse integer row number (may be multi-digit) */
     size_t num_start = pos;
     while(pos < s.size() && s[pos] >= '0' && s[pos] <= '9'){
         pos++;
@@ -138,7 +124,6 @@ static std::pair<size_t, size_t> parse_sq(const std::string& s, size_t& pos){
 }
 
 Move str_to_move(const std::string& s){
-    /* Drop move: X*sq (e.g. P*c3) */
     if(s.size() >= 3 && s[1] == '*'){
         int pt = drop_letter_to_type(s[0]);
         size_t pos = 2;
@@ -148,22 +133,17 @@ Move str_to_move(const std::string& s){
             Point(row, col)
         );
     }
-    /* Parse first square */
     size_t pos = 0;
     auto [fr, fc] = parse_sq(s, pos);
-    /* Placement move: no more squares to parse */
     if(pos >= s.size() || !std::isalpha(s[pos])){
         return Move(Point(fr, fc), Point(fr, fc));
     }
-    /* Board move: parse second square [+promote or qrbn suffix] */
     auto [tr, tc] = parse_sq(s, pos);
     if(pos < s.size()){
         char suffix = s[pos];
         if(suffix == '+'){
-            /* Shogi-style promotion */
             tr += BOARD_H;
         }else{
-            /* Chess-style promotion suffix: q=1, r=2, b=3, n=4 */
             int pidx = 0;
             switch(suffix){
                 case 'q': case 'Q': pidx = 1; break;
@@ -179,9 +159,7 @@ Move str_to_move(const std::string& s){
     return Move(Point(fr, fc), Point(tr, tc));
 }
 
-
 /* === Position Handling === */
-
 void set_position(
     const std::string& line,
     Board& board,
@@ -190,12 +168,11 @@ void set_position(
 ){
     std::istringstream iss(line);
     std::string token;
-    iss >> token; /* "startpos" or "board" */
-
+    iss >> token;
+    
     g_history.clear();
-
+    
     if(token == "board"){
-        /* position board <encoded_board> <side: 0 or 1> [moves ...] */
         std::string board_str;
         int side = 0;
         iss >> board_str >> side;
@@ -205,22 +182,17 @@ void set_position(
         player = state.player;
         step = 0;
     }else{
-        /* position startpos [moves ...] */
         Board start_board;
         board = start_board;
         player = 0;
         step = 0;
     }
-
-    /* Push the starting position hash */
+    
     {
         State start_state(board, player);
         g_history.push(start_state.hash());
     }
-
-    /* Replay any trailing moves via chained next_state calls.
-     * This preserves game-specific state (e.g. stones_left for Connect6)
-     * that would be lost by constructing State(board, player) each step. */
+    
     std::string moves_token;
     if(iss >> moves_token && moves_token == "moves"){
         State* cur = new State(board, player);
@@ -244,9 +216,7 @@ void set_position(
     }
 }
 
-
 /* === PV Formatting === */
-
 static std::string format_pv(const std::vector<Move>& pv){
     std::string result;
     for(size_t i = 0; i < pv.size(); i++){
@@ -258,10 +228,19 @@ static std::string format_pv(const std::vector<Move>& pv){
     return result;
 }
 
-
 /* === Search Dispatch (worker thread) === */
-
 static std::atomic<uint32_t> g_search_gen{0};
+
+struct ActiveCtxGuard {
+    ActiveCtxGuard(SearchContext* c) { 
+        std::lock_guard<std::mutex> lock(g_active_ctx_mutex);
+        g_active_ctx_ptr = c; 
+    }
+    ~ActiveCtxGuard() { 
+        std::lock_guard<std::mutex> lock(g_active_ctx_mutex);
+        g_active_ctx_ptr = nullptr; 
+    }
+};
 
 static void do_search(
     int max_depth,
@@ -274,6 +253,8 @@ static void do_search(
     GameHistory history,
     int step
 ){
+    ActiveCtxGuard ctx_guard(&ctx);
+
     State state(board, player);
     state.step = step;
     state.get_legal_actions();
@@ -296,6 +277,7 @@ static void do_search(
         g_searching = false;
         return;
     }
+
     if(state.game_state == WIN){
         if(alive()){
             send("bestmove " + move_to_str(state.legal_actions[0]));
@@ -306,20 +288,20 @@ static void do_search(
     }
 
     Move best_move = state.legal_actions[0];
-    g_best_move = best_move;
+    {
+        std::lock_guard<std::mutex> lock(g_bestmove_mutex);
+        g_best_move = best_move;
+    }
+
     int depth_limit = (max_depth > 0) ? max_depth : 100;
     uint64_t total_nodes = 0;
-
     auto search_start = std::chrono::high_resolution_clock::now();
 
-    /* === Root move partial-result callback === */
     ctx.on_root_update = [&](const RootUpdate& upd){
         if(my_gen != g_search_gen.load()){
             return;
         }
-        best_move = upd.best_move;
-        g_best_move = upd.best_move;
-
+        
         auto now = std::chrono::high_resolution_clock::now();
         int64_t elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             now - search_start
@@ -350,8 +332,9 @@ static void do_search(
 
         auto depth_start = std::chrono::high_resolution_clock::now();
         SearchResult result = g_algo->search(&state, depth, history, ctx);
-
-        if(!alive() && depth > 1){
+        
+        // 唯有安全存活並完整算完此層，才更新答案。這防止了垃圾 0000 覆寫。
+        if(!alive()){
             break;
         }
 
@@ -364,7 +347,10 @@ static void do_search(
         ).count();
 
         best_move = result.best_move;
-        g_best_move = best_move;
+        {
+            std::lock_guard<std::mutex> lock(g_bestmove_mutex);
+            g_best_move = best_move;
+        }
         total_nodes += result.nodes;
 
         uint64_t nps = (depth_ms > 0)
@@ -373,14 +359,15 @@ static void do_search(
 
         std::ostringstream info;
         info << "info depth " << depth
-            << " seldepth " << result.seldepth;
+             << " seldepth " << result.seldepth;
         if(multi_pv > 1){
             info << " multipv 1";
         }
         info << " score cp " << result.score
-            << " nodes " << total_nodes
-            << " time " << total_ms
-            << " nps " << nps;
+             << " nodes " << total_nodes
+             << " time " << total_ms
+             << " nps " << nps;
+
         if(!result.pv.empty()){
             info << " pv " << format_pv(result.pv);
         }
@@ -394,9 +381,7 @@ static void do_search(
             std::vector<Move> excluded;
             excluded.push_back(result.best_move);
             auto saved_actions = state.legal_actions;
-
             for(int mpv = 2; mpv <= multi_pv; mpv++){
-                /* Remove excluded moves from legal_actions */
                 state.legal_actions = saved_actions;
                 state.legal_actions.erase(
                     std::remove_if(state.legal_actions.begin(), state.legal_actions.end(),
@@ -405,10 +390,8 @@ static void do_search(
                         }),
                     state.legal_actions.end()
                 );
-                if(state.legal_actions.empty()){
-                    break;
-                }
-                if(!alive()){
+                
+                if(state.legal_actions.empty() || !alive()){
                     break;
                 }
 
@@ -421,7 +404,6 @@ static void do_search(
                 }
 
                 total_nodes += sub.nodes;
-
                 auto now2 = std::chrono::high_resolution_clock::now();
                 int64_t total_ms2 = std::chrono::duration_cast<std::chrono::milliseconds>(
                     now2 - search_start
@@ -434,55 +416,66 @@ static void do_search(
                     : 0
                 );
                 sub_info << "info depth " << depth
-                    << " seldepth " << sub.seldepth
-                    << " multipv " << mpv
-                    << " score cp " << sub.score
-                    << " nodes " << total_nodes
-                    << " time " << total_ms2
-                    << " nps " << sub_nps;
+                         << " seldepth " << sub.seldepth
+                         << " multipv " << mpv
+                         << " score cp " << sub.score
+                         << " nodes " << total_nodes
+                         << " time " << total_ms2
+                         << " nps " << sub_nps;
+
                 if(!sub.pv.empty()){
                     sub_info << " pv " << format_pv(sub.pv);
                 }
-
                 send(sub_info.str());
-
                 excluded.push_back(sub.best_move);
             }
-
-            state.legal_actions = saved_actions;  /* restore */
+            state.legal_actions = saved_actions; 
         }
 
         if(!alive()){
             break;
         }
-        if(movetime_ms > 0 && total_ms * 2 >= movetime_ms){
-            break;
+
+        // 核心邏輯：如果這個引擎被 CLI 標記為耳聾演算法 (g_safe_time = true)
+        // 就自動啟用預判攔截，防止它陷得太深。否則讓聰明演算法跑好跑滿。
+        if(g_safe_time){
+            if(movetime_ms > 0 && total_ms * 2 >= movetime_ms){
+                break;
+            }
         }
+
         if(result.score >= P_MAX - 100 || result.score <= M_MAX + 100){
             break;
         }
     }
 
-    if(alive()){
-        send("bestmove " + move_to_str(best_move));
-        g_bestmove_sent = true;
+    if(alive() || g_ctx.stop){
+        if(!g_bestmove_sent.load()){
+            g_bestmove_sent = true;
+            std::lock_guard<std::mutex> lock(g_bestmove_mutex);
+            send("bestmove " + move_to_str(best_move));
+        }
     }
     g_searching = false;
 }
 
-
 /* === Command: go === */
-
 static void cmd_go(std::istringstream& iss){
     g_ctx.stop = true;
+    
+    {
+        std::lock_guard<std::mutex> lock(g_active_ctx_mutex);
+        if(g_active_ctx_ptr) g_active_ctx_ptr->stop = true;
+    }
+
     if(g_search_thread.joinable()){
         g_search_thread.join();
     }
-
+    
     int max_depth = 0;
     int64_t movetime_ms = 0;
     bool infinite = false;
-
+    
     std::string token;
     while(iss >> token){
         if(token == "depth"){
@@ -493,27 +486,38 @@ static void cmd_go(std::istringstream& iss){
             infinite = true;
         }
     }
-
     if(max_depth == 0 && movetime_ms == 0 && !infinite){
         max_depth = 6;
     }
-
+    
     SearchContext ctx;
     ctx.params = g_params;
     g_ctx.stop = false;
     g_searching = true;
     g_bestmove_sent = false;
+    
     uint32_t gen = g_search_gen.load();
-    g_best_move = Move();
+    {
+        std::lock_guard<std::mutex> lock(g_bestmove_mutex);
+        g_best_move = Move();
+    }
+    
     g_search_thread = std::thread(
         do_search, max_depth, movetime_ms, infinite, gen, ctx, g_board, g_player, g_history, g_step
     );
 }
 
-
 /* === Command: position === */
-
 static void cmd_position(std::istringstream& iss){
+    g_ctx.stop = true;
+    {
+        std::lock_guard<std::mutex> lock(g_active_ctx_mutex);
+        if(g_active_ctx_ptr) g_active_ctx_ptr->stop = true;
+    }
+    if(g_search_thread.joinable()){
+        g_search_thread.join();
+    }
+
     std::string rest;
     std::getline(iss, rest);
     size_t start = rest.find_first_not_of(' ');
@@ -523,9 +527,7 @@ static void cmd_position(std::istringstream& iss){
     set_position(rest, g_board, g_player, g_step);
 }
 
-
 /* === Command: setoption === */
-
 static void cmd_setoption(std::istringstream& iss){
     std::string token, name, value;
     while(iss >> token){
@@ -535,7 +537,6 @@ static void cmd_setoption(std::istringstream& iss){
             iss >> value;
         }
     }
-
     if(name == "Algorithm" || name == "algorithm"){
         std::string lower = value;
         std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
@@ -549,14 +550,15 @@ static void cmd_setoption(std::istringstream& iss){
         if(mpv >= 1 && mpv <= 10){
             g_multi_pv = mpv;
         }
+    }else if(name == "SafeTime" || name == "safetime"){
+        // 由 Python CLI 在判定耳聾演算法後發送，保護進程
+        g_safe_time = (value == "true" || value == "1");
     }else{
         g_params[name] = value;
     }
 }
 
-
 /* === Command: d (debug display) === */
-
 static void cmd_display(){
     State state(g_board, g_player);
     std::ostringstream oss;
@@ -565,7 +567,6 @@ static void cmd_display(){
         oss << " " << static_cast<char>('a' + c) << " ";
     }
     oss << "\n";
-
     for(int r = 0; r < BOARD_H; r++){
         int row_label = BOARD_H - r;
         oss << row_label << " ";
@@ -574,44 +575,36 @@ static void cmd_display(){
         }
         oss << " " << row_label << "\n";
     }
-
     oss << "  ";
     for(int c = 0; c < BOARD_W; c++){
         oss << " " << static_cast<char>('a' + c) << " ";
     }
     oss << "\n";
-
     oss << "Side to move: " << (g_player == 0 ? "white" : "black") << "\n";
     oss << "Step: " << g_step << "\n";
     oss << "Algorithm: " << g_algo->name << "\n";
-
     send(oss.str());
 }
 
-
 /* === Algorithm Option String === */
-
 static std::string algo_option_str(){
     const auto& table = get_algo_table();
     std::string s = "option name Algorithm type combo default " + default_algo_name();
     for(auto& entry : table){
         s += " var " + entry.name;
     }
+    s += " option name SafeTime type check default false";
     return s;
 }
 
-
 /* === Main Loop === */
-
 void loop(){
     std::cout << std::unitbuf;
-
     g_algo = find_algo(default_algo_name());
     g_params = g_algo->default_params;
 
     std::string handshake_cmd;
     std::string line;
-
     while(std::getline(std::cin, line)){
         if(!line.empty() && line.back() == '\r'){
             line.pop_back();
@@ -619,7 +612,6 @@ void loop(){
         if(line.empty()){
             continue;
         }
-
         std::istringstream iss(line);
         std::string cmd;
         iss >> cmd;
@@ -632,6 +624,7 @@ void loop(){
             send(std::string("option name GameName type string default ") + id_state.game_name());
             send("option name BoardWidth type spin default " + std::to_string(BOARD_W) + " min 1 max 26");
             send("option name BoardHeight type spin default " + std::to_string(BOARD_H) + " min 1 max 26");
+
             send(algo_option_str());
             for(auto& pd : g_algo->param_defs){
                 if(pd.type == ParamDef::CHECK){
@@ -645,6 +638,7 @@ void loop(){
                 }
             }
             send("option name MultiPV type spin default 1 min 1 max 10");
+
             if(handshake_cmd == "ubgi"){
                 send("ubgiok");
             }else{
@@ -660,16 +654,32 @@ void loop(){
             cmd_go(iss);
         }else if(cmd == "stop"){
             g_ctx.stop = true;
+            
+            {
+                std::lock_guard<std::mutex> lock(g_active_ctx_mutex);
+                if(g_active_ctx_ptr) g_active_ctx_ptr->stop = true;
+            }
+
+            // 安全確保執行緒收斂，確保 Python 若放寬時間能正確等待
             if(g_search_thread.joinable()){
                 g_search_thread.join();
             }
-            /* If the search thread was interrupted before it could emit
-               bestmove, send one now so the GUI/CLI never hangs. */
+            
             if(!g_bestmove_sent.load()){
                 g_bestmove_sent = true;
+                std::lock_guard<std::mutex> lock(g_bestmove_mutex);
                 send("bestmove " + move_to_str(g_best_move));
             }
         }else if(cmd == "ucinewgame" || cmd == "ubginewgame"){
+            g_ctx.stop = true;
+            {
+                std::lock_guard<std::mutex> lock(g_active_ctx_mutex);
+                if(g_active_ctx_ptr) g_active_ctx_ptr->stop = true;
+            }
+            if(g_search_thread.joinable()){
+                g_search_thread.join();
+            }
+
             g_board = Board();
             g_player = 0;
             g_step = 0;
@@ -678,6 +688,12 @@ void loop(){
             cmd_display();
         }else if(cmd == "quit"){
             g_ctx.stop = true;
+            
+            {
+                std::lock_guard<std::mutex> lock(g_active_ctx_mutex);
+                if(g_active_ctx_ptr) g_active_ctx_ptr->stop = true;
+            }
+
             if(g_search_thread.joinable()){
                 g_search_thread.join();
             }
@@ -692,9 +708,7 @@ void loop(){
 
 } // namespace ubgi
 
-
 /* === Entry Point === */
-
 int main(){
     ubgi::loop();
     return 0;

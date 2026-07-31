@@ -106,7 +106,7 @@ def play_game(white, black, models, settings, counter, logger):
             if any(char in line for char in ["♔", "♕", "♖", "♗", "♘", "♙", "♚", "♛", "♜", "♝", "♞", "♟", "─", "│", "┌", "┐", "└", "┘", "├", "┤", "┬", "┴", "┼"]):
                 continue
 
-            if "White:" in line or "Black:" in line or "Result:" in line or "===" in line or "Score after" in line or "wins!" in line or "Draw" in line or "Random Opening" in line:
+            if "White" in line or "Black" in line or "Result:" in line or "===" in line or "Score after" in line or "wins!" in line or "Draw" in line or "Random Opening" in line or "[DEBUG]" in line:
                 logger.write(f"  {line}\n")
 
             if ("White:" in line or "Black:" in line) and ("." in line):

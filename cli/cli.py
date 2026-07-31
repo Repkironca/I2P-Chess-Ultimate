@@ -21,6 +21,9 @@ _SHOGI_FAMILY = frozenset()
 _BOARD_GAMES = _CHESS_FAMILY | _SHOGI_FAMILY
 _game_ctx: dict = {}
 
+# 全局紀錄曾發生超時裝死的耳聾演算法
+_DEAF_ALGOS = set()
+
 def _init_game(game_name: str, board_size: int | None = None) -> None:
     _game_ctx.update(_minichess_ctx())
 
@@ -40,7 +43,16 @@ def format_search_info(info: dict | None) -> str:
     score_cp = info.get("score_cp")
     if score_cp is not None: parts.append(f"score={score_cp / 100.0:+.2f}")
     elif info.get("score_mate") is not None: parts.append(f"mate={info['score_mate']}")
-    if info.get("string") == "Random Opening": parts.append("Random Opening")
+    
+    real_time = info.get("real_time_ms")
+    reason = info.get("reason")
+    if real_time is not None and reason is not None:
+        parts.append(f"耗時={real_time:.0f}ms [{reason}]")
+
+    # 顯示任何 string 標籤 (包含 Random Opening 與 Fallback 重啟警告)
+    if info.get("string"): 
+        parts.append(info["string"])
+        
     return ", ".join(parts)
 
 def format_move_display(move_or_uci, state=None) -> str:
@@ -81,6 +93,8 @@ def run_game(
     depth: int = 0, params: list[str] | None = None, white_params: list[str] | None = None, black_params: list[str] | None = None,
     random_open: str = "0"
 ) -> str:
+    global _DEAF_ALGOS
+    
     game_name = _game_ctx.get("name", "generic")
     has_state = game_name != "generic"
     uci_moves: list[str] = []
@@ -105,21 +119,38 @@ def run_game(
         if k_limit > 0: print(f"  Random Opening: First {k_limit} moves", flush=True)
         if has_state and show_board: print_board(state)
 
+    w_opts = {"Algorithm": white_algo}
+    for p in (params or []) + (white_params or []):
+        if "=" in p: k, v = p.split("=", 1); w_opts[k] = v
+    if white_algo in _DEAF_ALGOS: w_opts["SafeTime"] = "true"
+
+    b_opts = {"Algorithm": black_algo}
+    for p in (params or []) + (black_params or []):
+        if "=" in p: k, v = p.split("=", 1); b_opts[k] = v
+    if black_algo in _DEAF_ALGOS: b_opts["SafeTime"] = "true"
+
     w_eng, b_eng = None, None
-    try:
-        if white_path != "human":
-            w_opts = {"Algorithm": white_algo}
-            for p in (params or []) + (white_params or []):
-                if "=" in p: k, v = p.split("=", 1); w_opts[k] = v
+
+    def _restart_engine(is_white_turn):
+        nonlocal w_eng, b_eng
+        if is_white_turn:
+            if w_eng: 
+                try: w_eng.quit()
+                except: pass
             w_eng = UBGIEngine(os.path.abspath(white_path), initial_options=w_opts)
             w_eng.new_game()
-
-        if black_path != "human":
-            b_opts = {"Algorithm": black_algo}
-            for p in (params or []) + (black_params or []):
-                if "=" in p: k, v = p.split("=", 1); b_opts[k] = v
+            return w_eng
+        else:
+            if b_eng: 
+                try: b_eng.quit()
+                except: pass
             b_eng = UBGIEngine(os.path.abspath(black_path), initial_options=b_opts)
             b_eng.new_game()
+            return b_eng
+
+    try:
+        if white_path != "human": w_eng = _restart_engine(True)
+        if black_path != "human": b_eng = _restart_engine(False)
 
         while True:
             if has_state:
@@ -153,17 +184,55 @@ def run_game(
                     def done_cb(bm): 
                         move_res['bm'] = bm; done_event.set()
 
+                    start_time = time.time()
+                    
                     if depth > 0:
                         active_eng.go(depth=depth, info_callback=info_cb, done_callback=done_cb)
                         done_event.wait()
+                        reason = "指定深度"
                     else:
                         active_eng.go(movetime=time_limit, info_callback=info_cb, done_callback=done_cb)
                         
-                        # 模板控管時間：精準等待 2000ms (加上 0.05 秒系統排程誤差寬容)
+                        # 正常等待時間 2000ms
                         is_done = done_event.wait(timeout=(time_limit / 1000.0) + 0.05)
                         
                         if not is_done:
-                            active_eng.stop_and_wait(timeout=2.0)
+                            stop_start = time.time()
+                            try: 
+                                # 將容忍上限放大到 4000ms
+                                active_eng.stop_and_wait(timeout=4.0)
+                            except: 
+                                pass
+                            
+                            is_finally_done = done_event.wait(timeout=0.1)
+                            stop_wait = time.time() - stop_start
+                            reason = f"強制截斷 (延遲 {stop_wait:.1f}s)"
+
+                            active_algo = white_algo if is_white else black_algo
+                            
+                            # 1. 如果延遲超過 2 秒，且尚未被標記，則標記為耳聾演算法並設定 SafeTime
+                            if stop_wait > 2.0 and active_algo not in _DEAF_ALGOS:
+                                _DEAF_ALGOS.add(active_algo)
+                                if is_white: w_opts["SafeTime"] = "true"
+                                else: b_opts["SafeTime"] = "true"
+                                if verbose: print(f"  [系統公告] {active_algo} 反應遲鈍，標記為耳聾演算法，後續套用 SafeTime！", flush=True)
+                            
+                            # 2. 如果超過 4000ms (is_finally_done=False) 或是引擎死機沒給步數，發動最後手段
+                            if not is_finally_done or not move_res.get('bm'):
+                                if last_info.get("pv") and len(last_info["pv"]) > 0:
+                                    move_res['bm'] = last_info["pv"][0]
+                                elif last_info.get("currmove"):
+                                    move_res['bm'] = last_info["currmove"]
+                                
+                                if move_res.get('bm'):
+                                    last_info['string'] = "Fallback: 超過 4000ms 無回應，引擎已被 Kill() 重啟"
+                                    active_eng = _restart_engine(is_white)
+                        else:
+                            reason = "自然算完"
+
+                    elapsed_ms = (time.time() - start_time) * 1000.0
+                    last_info["real_time_ms"] = elapsed_ms
+                    last_info["reason"] = reason
 
                     bestmove_uci = move_res.get('bm')
                     info = last_info
