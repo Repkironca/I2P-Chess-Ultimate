@@ -7,7 +7,11 @@ import random
 import subprocess
 import itertools
 import re
+import threading
+import tempfile
+import shutil
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -16,6 +20,9 @@ LOG_DIR = "logs"
 RECORD_DIR = "records"
 TASK_FILE = "arena_tasks.json"
 MAX_CONSECUTIVE_DRAWS = 3 
+
+# 用於最初啟動時的簡單錯峰，避免瞬間啟動引發系統當機
+engine_spawn_lock = threading.Lock()
 
 for d in [LOG_DIR, RECORD_DIR]:
     os.makedirs(d, exist_ok=True)
@@ -53,21 +60,28 @@ def get_engine_path(name):
         return base_path + ".exe" if os.path.exists(base_path + ".exe") else base_path
     return base_path
 
-# ==========================================
-# 極簡封裝：直接呼叫改版後的 cli.py
-# ==========================================
-def play_game(white, black, models, settings, counter, logger):
-    idx = counter.count
-    counter.count += 1
+def play_game(white, black, models, settings, counter, logger, is_parallel=False, print_lock=None):
+    if print_lock:
+        with print_lock:
+            idx = counter.count
+            counter.count += 1
+            logger.write(f"\n⚔️ 第 {idx} 局: [白] {white} VS [黑] {black} ... (激戰中)\n")
+    else:
+        idx = counter.count
+        counter.count += 1
+        logger.write(f"\n{'='*60}\n")
+        logger.write(f"⚔️ 第 {idx} 局: [白] {white} VS [黑] {black} ... (激戰中)\n")
+        logger.write(f"{'='*60}\n")
     
-    logger.write(f"\n{'='*60}\n")
-    logger.write(f"⚔️ 第 {idx} 局: [白] {white} VS [黑] {black} ... (激戰中)\n")
-    logger.write(f"{'='*60}\n")
+    w_path = os.path.abspath(get_engine_path(white))
+    b_path = os.path.abspath(get_engine_path(black))
     
-    w_path = get_engine_path(white)
-    b_path = get_engine_path(black)
     if not os.path.exists(w_path) or not os.path.exists(b_path):
-        logger.write(f"⚠️ 失敗! 找不到執行檔。\n")
+        msg = f"⚠️ 失敗! 找不到執行檔 (局數 {idx})。\n"
+        if print_lock:
+            with print_lock: logger.write(msg)
+        else:
+            logger.write(msg)
         return "skip"
 
     w_algo = models.get(white, "minimax")
@@ -81,33 +95,56 @@ def play_game(white, black, models, settings, counter, logger):
         "--games", "1",
         "--verbose",
         "--no-board",
-        "--random-open", str(settings.get('rand_open', '0')), # 傳入隨機開局參數
+        "--random-open", str(settings.get('rand_open', '0')), 
         "--white-algo", w_algo,
         "--black-algo", b_algo
     ]
 
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.path.abspath(".") + os.pathsep + env.get("PYTHONPATH", "")
+    
     moves = []
     winner = None
-
+    last_logs = []
+    tmpdir = tempfile.mkdtemp()
+    
     try:
-        proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, encoding='utf-8', errors='replace'
-        )
+        if is_parallel:
+            with engine_spawn_lock:
+                proc = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, encoding='utf-8', errors='replace',
+                    cwd=tmpdir, env=env
+                )
+                time.sleep(2.0) # 簡單錯峰 2 秒即可
+        else:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding='utf-8', errors='replace',
+                cwd=tmpdir, env=env
+            )
 
         for line in proc.stdout:
             line = line.strip()
             if not line: continue
+            
+            last_logs.append(line)
+            if len(last_logs) > 30:
+                last_logs.pop(0)
 
             if any(err_word in line for err_word in ["Traceback", "SyntaxError", "Exception", "Error:"]):
-                logger.write(f"  [系統報錯] {line}\n")
+                if print_lock:
+                    with print_lock: logger.write(f"  [局數 {idx} 系統報錯] {line}\n")
+                else:
+                    logger.write(f"  [系統報錯] {line}\n")
                 continue
             
             if any(char in line for char in ["♔", "♕", "♖", "♗", "♘", "♙", "♚", "♛", "♜", "♝", "♞", "♟", "─", "│", "┌", "┐", "└", "┘", "├", "┤", "┬", "┴", "┼"]):
                 continue
 
-            if "White" in line or "Black" in line or "Result:" in line or "===" in line or "Score after" in line or "wins!" in line or "Draw" in line or "Random Opening" in line or "[DEBUG]" in line:
-                logger.write(f"  {line}\n")
+            if not is_parallel:
+                if "White" in line or "Black" in line or "Result:" in line or "===" in line or "Score after" in line or "wins!" in line or "Draw" in line or "Random Opening" in line or "[DEBUG]" in line:
+                    logger.write(f"  {line}\n")
 
             if ("White:" in line or "Black:" in line) and ("." in line):
                 try:
@@ -138,11 +175,22 @@ def play_game(white, black, models, settings, counter, logger):
         proc.wait()
 
     except Exception as e:
-        logger.write(f"⚠️ 失敗! (執行 cli.cli 時發生例外: {e})\n")
+        msg = f"⚠️ 失敗! (執行局數 {idx} cli.cli 時發生例外: {e})\n"
+        if print_lock:
+            with print_lock: logger.write(msg)
+        else:
+            logger.write(msg)
         return "skip"
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
     if winner is None:
-        logger.write("⚠️ 警告: 未能解析正常勝負。\n")
+        error_msg = "\n".join(last_logs)
+        msg = f"⚠️ 警告: 局數 {idx} 未能解析正常勝負。\n[崩潰前最後 30 行輸出]:\n{error_msg}\n"
+        if print_lock:
+            with print_lock: logger.write(msg)
+        else:
+            logger.write(msg)
         return "skip"
 
     record = {
@@ -152,15 +200,32 @@ def play_game(white, black, models, settings, counter, logger):
         "winner": winner, "total_moves": len(moves),
         "moves": moves
     }
-    file_name = f"{int(time.time()*1000)}_{white}_vs_{black}.json"
+    
+    file_name = f"{int(time.time()*1000)}_{idx}_{white}_vs_{black}.json"
     with open(os.path.join(RECORD_DIR, file_name), 'w', encoding='utf-8') as f:
         json.dump(record, f, indent=2, ensure_ascii=False)
         
-    logger.write(f"\n🎉 局數 {idx} 完成! 勝方: {winner} (共 {len(moves)} 步)\n")
+    msg = f"🎉 局數 {idx} 完成! 勝方: {winner} (共 {len(moves)} 步)\n"
+    if print_lock:
+        with print_lock: logger.write(msg)
+    else:
+        logger.write("\n" + msg)
+        
     return winner
 
 def run_round_robin(matches, models, settings, counter, logger):
-    for w, b in matches: play_game(w, b, models, settings, counter, logger)
+    workers = settings.get("parallel_workers", 1)
+    if workers > 1:
+        print_lock = threading.Lock()
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = []
+            for w, b in matches:
+                futures.append(executor.submit(play_game, w, b, models, settings, counter, logger, True, print_lock))
+            for f in futures:
+                f.result()
+    else:
+        for w, b in matches: 
+            play_game(w, b, models, settings, counter, logger, False, None)
 
 def play_match_series(p1, p2, bo_x, rand_first, models, settings, counter, logger):
     wins = {p1: 0, p2: 0}
@@ -200,7 +265,6 @@ def run_elimination(participants, models, settings, elim_settings, counter, logg
             
         logger.write(f"\n--- 🏆 淘汰賽 第 {round_num} 輪 ---\n")
         
-        # 確保同敗場數者的配對是完全隨機的
         random.shuffle(active)
         active.sort(key=lambda x: losses[x]) 
         matches = [(active[i], active[i+1]) for i in range(0, len(active)-1, 2)]
@@ -212,7 +276,6 @@ def run_elimination(participants, models, settings, elim_settings, counter, logg
             elif winner == p2: losses[p1] += 1
             else: losses[p1] += 1; losses[p2] += 1
         
-        # 【新增】每一輪結束，完整輸出晉級與淘汰名單
         advanced = [p for p in active if losses[p] < (2 if is_double else 1)]
         eliminated = [p for p in active if losses[p] >= (2 if is_double else 1)]
         
@@ -291,6 +354,13 @@ def main():
             k = get_input("  每組對手互相對戰次數 (K)? ", cast_type=int, min_val=1)
             swap = get_yes_no("  是否交換黑白重賽?")
             rand_open = get_input("  ➤ 隨機開局步數 (例如 '3' 或區間 '1-3'，輸入 '0' 關閉)? ", cast_type=str)
+            
+            is_parallel = get_yes_no("  ➤ 是否啟用平行運算 (Parallel Execution)?")
+            if is_parallel:
+                workers = get_input("  ➤ 請輸入同時對戰的數量 (建議依據您的硬體輸入 2 或 4): ", cast_type=int, min_val=2)
+                task_data["settings"]["parallel_workers"] = workers
+            else:
+                task_data["settings"]["parallel_workers"] = 1
             
             matches = []
             for w, b in itertools.combinations(list(models.keys()), 2):

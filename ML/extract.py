@@ -1,174 +1,115 @@
-import pandas as pd
-import numpy as np
 import os
+import json
+import pandas as pd
+import glob
+import shutil
 
-def init_board():
-    grid = [[0]*5 for _ in range(6)]
-    # Black (正數)
-    grid[0] = [6, 5, 4, 3, 2] # K, Q, B, N, R
-    grid[1] = [1, 1, 1, 1, 1] # P
-    # White (負數)
-    grid[4] = [-1, -1, -1, -1, -1] # P
-    grid[5] = [-2, -3, -4, -5, -6] # R, N, B, Q, K
-    return grid
+# ==========================================
+# 嚴格對齊順序：空格(0), 小兵(1), 騎士(2), 主教(3), 城堡(4), 皇后(5), 國王(6)
+# 白方為正數，黑方為負數
+# 對齊 MinitChess 初始盤面
+# ==========================================
+INITIAL_BOARD = [
+    [-4, -2, -3, -5, -6], # Row 0 (Rank 6) 黑方: r(a6), n(b6), b(c6), q(d6), k(e6)
+    [-1, -1, -1, -1, -1], # Row 1 (Rank 5) 黑方 Pawn
+    [ 0,  0,  0,  0,  0], # Row 2 (Rank 4)
+    [ 0,  0,  0,  0,  0], # Row 3 (Rank 3)
+    [ 1,  1,  1,  1,  1], # Row 4 (Rank 2) 白方 Pawn
+    [ 4,  2,  3,  5,  6]  # Row 5 (Rank 1) 白方: R(a1), N(b1), B(c1), Q(d1), K(e1)
+]
 
-def parse_sq(sq_str):
-    col = ord(sq_str[0]) - ord('a')
-    row = 6 - int(sq_str[1:])
-    return row, col
+def create_and_clear_dir(dir_path):
+    if os.path.exists(dir_path):
+        shutil.rmtree(dir_path)
+    os.makedirs(dir_path)
 
-def get_pseudo_legal_and_tactical(grid, player):
-    mobility = 0
-    tactical_threats = [0]*6
+def uci_to_coords(uci):
+    # 將 c2c3 這類字串轉為二維陣列的 row, col
+    from_c = ord(uci[0]) - ord('a')
+    from_r = 6 - int(uci[1])
+    to_c = ord(uci[2]) - ord('a')
+    to_r = 6 - int(uci[3])
+    return from_r, from_c, to_r, to_c
+
+def extract_games(records_dir="../records", output_dir="../ML/extracted"):
+    create_and_clear_dir(output_dir)
+    output_csv = os.path.join(output_dir, "dataset.csv")
     
-    dr = [-1, 1, 0, 0, -1, -1, 1, 1]
-    dc = [0, 0, -1, 1, -1, 1, -1, 1]
-    knight_dr = [-2, -2, -1, -1, 1, 1, 2, 2]
-    knight_dc = [-1, 1, -2, 2, -2, 2, -1, 1]
+    all_features = []
+    json_files = glob.glob(os.path.join(records_dir, "*.json"))
     
-    for r in range(6):
-        for c in range(5):
-            p = grid[r][c]
-            if p == 0: continue
-            is_white = (p < 0)
-            if (player == 0 and not is_white) or (player == 1 and is_white):
-                continue
-                
-            ptype = abs(p)
-            targets = []
-            
-            if ptype == 1:
-                dir = -1 if player == 0 else 1
-                if 0 <= r + dir < 6:
-                    if grid[r + dir][c] == 0:
-                        targets.append((r + dir, c))
-                    if c > 0 and grid[r + dir][c - 1] != 0 and (grid[r + dir][c - 1] > 0) != (player == 1):
-                        targets.append((r + dir, c - 1))
-                    if c < 4 and grid[r + dir][c + 1] != 0 and (grid[r + dir][c + 1] > 0) != (player == 1):
-                        targets.append((r + dir, c + 1))
-            elif ptype == 3:
-                for i in range(8):
-                    nr, nc = r + knight_dr[i], c + knight_dc[i]
-                    if 0 <= nr < 6 and 0 <= nc < 5:
-                        targets.append((nr, nc))
-            elif ptype == 6:
-                for i in range(8):
-                    nr, nc = r + dr[i], c + dc[i]
-                    if 0 <= nr < 6 and 0 <= nc < 5:
-                        targets.append((nr, nc))
-            else:
-                st = 0 if ptype in (2, 5) else 4
-                ed = 4 if ptype == 2 else 8
-                for i in range(st, ed):
-                    nr, nc = r + dr[i], c + dc[i]
-                    while 0 <= nr < 6 and 0 <= nc < 5:
-                        targets.append((nr, nc))
-                        if grid[nr][nc] != 0: break
-                        nr += dr[i]
-                        nc += dc[i]
-                        
-            for tr, tc in targets:
-                target_p = grid[tr][tc]
-                if target_p == 0:
-                    mobility += 1
-                elif (target_p > 0) != (player == 1):
-                    mobility += 1
-                    tactical_threats[abs(target_p) - 1] += 1
-                    
-    return mobility, tactical_threats
-
-def extract_features():
-    # 宣告檔案來源與其基礎權重
-    datasets = [('dataset_hq.csv', 1.0)]
-    if os.path.exists('dataset_ultra.csv'):
-        print("偵測到 dataset_ultra.csv，套用 10 倍權重加成！")
-        datasets.append(('dataset_ultra.csv', 10.0))
-        
-    X_list, y_list, step_list, weight_list = [], [], [], []
+    print(f"Found {len(json_files)} game records. Extracting...")
     
-    for file_path, base_w in datasets:
+    for file_path in json_files:
         try:
-            df = pd.read_csv(file_path)
-            print(f"處理 {file_path} 中... ({len(df)} 場對局)")
-        except FileNotFoundError:
-            continue
-            
-        for idx, row in df.iterrows():
-            res_str = str(row['Result'])
-            if '1.0' in res_str or '1' == res_str: y_val = 1
-            elif '0.0' in res_str or '0' == res_str: y_val = -1
-            else: y_val = 0
-            
-            moves = row['Moves'].strip().split()
-            grid = init_board()
-            step = 1
-            player = 0
-            
-            for mv in moves:
-                if len(mv) < 4: continue
-                fr, fc = parse_sq(mv[0:2])
-                tr, tc = parse_sq(mv[2:4])
+            with open(file_path, 'r', encoding='utf-8') as f:
+                game_data = json.load(f)
                 
-                p = grid[fr][fc]
-                grid[fr][fc] = 0
-                if abs(p) == 1 and (tr == 0 or tr == 5):
-                    p = -5 if p < 0 else 5
-                grid[tr][tc] = p
+            # 讀取勝負
+            winner_str = game_data.get("winner", "draw")
+            if winner_str == "white":
+                game_result = 1.0
+            elif winner_str == "black":
+                game_result = 0.0
+            else:
+                game_result = 0.5
                 
-                f = np.zeros(230)
-                w_kr, w_kc, b_kr, b_kc = -1, -1, -1, -1
-                for r in range(6):
-                    for c in range(5):
-                        if grid[r][c] == -6: w_kr, w_kc = r, c
-                        if grid[r][c] == 6: b_kr, b_kc = r, c
-                        
-                safe_step = min(step, 300)
-                for r in range(6):
-                    for c in range(5):
-                        val = grid[r][c]
-                        if val == 0: continue
-                        is_white = (val < 0)
-                        ptype = abs(val)
-                        
-                        pr = r if is_white else (5 - r)
-                        idx_pst = pr * 5 + c
-                        sign = 1 if is_white else -1
-                        
-                        if ptype < 6:
-                            f[ptype - 1] += sign 
-                            
-                            opp_kr = b_kr if is_white else w_kr
-                            opp_kc = b_kc if is_white else w_kc
-                            if opp_kr != -1:
-                                dist = abs(r - opp_kr) + abs(c - opp_kc)
-                                f[5 + ptype - 1] += sign * dist
-                                
-                        f[10 + (ptype - 1) * 30 + idx_pst] += sign
-                        
-                        if ptype == 1 and 1 <= pr <= 4:
-                            f[190 + pr - 1] += sign
-                            
-                        if ptype == 6:
-                            f[194 + idx_pst] += sign * safe_step
-                            
-                w_mob, w_tac = get_pseudo_legal_and_tactical(grid, 0)
-                b_mob, b_tac = get_pseudo_legal_and_tactical(grid, 1)
+            white_player = game_data.get("white", "unknown")
+            black_player = game_data.get("black", "unknown")
+            timestamp = game_data.get("timestamp", "")
+            moves = game_data.get("moves", [])
+            
+            # 初始化 5x6 棋盤副本
+            board = [row[:] for row in INITIAL_BOARD]
+            
+            # 依序執行每一手
+            for step, move_info in enumerate(moves):
+                # 攤平盤面為一維陣列 (長度 30)
+                flat_board = [piece for row in board for piece in row]
+                current_player = 0 if step % 2 == 0 else 1
                 
-                for i in range(5):
-                    f[224 + i] = w_tac[i] - b_tac[i]
+                row_data = {
+                    "timestamp": timestamp,
+                    "game_id": os.path.basename(file_path),
+                    "white_player": white_player,
+                    "black_player": black_player,
+                    "step": step,
+                    "current_player": current_player,
+                    "result": game_result
+                }
+                
+                # 寫入 30 個格子的狀態
+                for i in range(30):
+                    row_data[f"sq_{i}"] = flat_board[i]
                     
-                f[229] = w_mob - b_mob
+                all_features.append(row_data)
                 
-                X_list.append(f)
-                y_list.append(y_val)
-                step_list.append(step)
-                weight_list.append(base_w)
+                # 更新棋盤以供下一回合萃取
+                uci = move_info.get("move", "")
+                if not uci or uci == "0000":
+                    break
+                    
+                fr, fc, tr, tc = uci_to_coords(uci)
                 
-                player = 1 - player
-                step += 1
+                piece = board[fr][fc]
+                board[fr][fc] = 0
+                board[tr][tc] = piece
                 
-    np.savez_compressed('features.npz', X=np.array(X_list), y=np.array(y_list), steps=np.array(step_list), weights=np.array(weight_list))
-    print("特徵萃取完成，已儲存至 features.npz")
+                # 小兵升變判斷
+                if piece == 1 and tr == 0:
+                    board[tr][tc] = 5
+                elif piece == -1 and tr == 5:
+                    board[tr][tc] = -5
+                    
+        except Exception as e:
+            print(f"Error parsing {file_path}: {e}")
+            
+    if all_features:
+        df = pd.DataFrame(all_features)
+        df.to_csv(output_csv, index=False)
+        print(f"Extraction complete! Saved {len(df)} samples to {output_csv}.")
+    else:
+        print("Failed to extract any samples.")
 
-if __name__ == '__main__':
-    extract_features()
+if __name__ == "__main__":
+    extract_games()

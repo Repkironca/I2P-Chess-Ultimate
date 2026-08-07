@@ -312,6 +312,22 @@ int Policy::eval_ctx(State *state, int depth, GameHistory& history, int ply, Sea
     if(state->game_state == WIN) return P_MAX - ply; 
     if(state->game_state == DRAW) return 0;
 
+
+    // 不是葉節點，且深度夠淺 (通常 RFP 只對剩餘深度 3 以內的分支有效)
+    if (depth <= 3 && depth > 0) {
+        
+        // 計算當下的靜態盤面分數
+        int static_eval = custom_evaluate(state); 
+        
+        // 設定容錯值 (Margin)：每深 1 層，給予約 1 顆小兵的容錯空間
+        int margin = 1.2 * PIECE_VALUES[1] * depth; 
+
+        // 如果我方優勢大到「即使少走一步 (減去 margin)，對手依然無法打破 beta 邊界」
+        if (static_eval - margin >= beta) {
+            return static_eval; // 霸道剪枝：直接退回靜態分數，省下後續所有 legal_actions 展開與遞迴！
+        }
+    }
+
     int rep_score;
     if(state->check_repetition(history, rep_score)) return rep_score;
     uint64_t ha = state->hash();
@@ -514,4 +530,4 @@ std::vector<ParamDef> Policy::param_defs(){
     };
 }
 
-} // namespace DuckyQuack
+} // namespace Logistic

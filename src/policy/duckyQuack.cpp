@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <chrono>
 #include <utility>
+#include <cmath>
 
 #include "state.hpp"
 #include "duckyQuack.hpp"
@@ -14,135 +15,95 @@ static int custom_evaluate(State* state, bool use_dyna = true) {
 
     auto self_board = state->board.board[state->player];
     auto oppn_board = state->board.board[1 - state->player];
-    int self_score = 0, oppn_score = 0;
+    
+    double self_score = 0;
+    double oppn_score = 0;
 
-    int self_kr = -1, self_kc = -1;
-    int oppn_kr = -1, oppn_kc = -1;
-
-    // 1. 快速尋找雙方國王 (供 V2 曼哈頓距離使用)
-    for (int r = 0; r < BOARD_H; r++) {
-        for (int c = 0; c < BOARD_W; c++) {
-            if (self_board[r][c] == 6) { self_kr = r; self_kc = c; }
-            if (oppn_board[r][c] == 6) { oppn_kr = r; oppn_kc = c; }
-        }
-    }
-
-    auto manhattan = [](int r1, int c1, int r2, int c2) {
-        return std::abs(r1 - r2) + std::abs(c1 - c2);
-    };
-
-    // V6 所需：步數保護機制 (防呆，避免異常值導致權重爆炸)
     int safe_step = state->step;
     if (safe_step < 0 || safe_step > 300) safe_step = 20;
 
-    // 2. 靜態區，嚴格對齊公式：V1, V2, V3, V5, V6
+    int self_official = 0;
+    int oppn_official = 0;
+
     for (int r = 0; r < BOARD_H; r++) {
         for (int c = 0; c < BOARD_W; c++) {
             
             // --- 幫我方計算 ---
             int sp = self_board[r][c];
             if (sp > 0) {
-                // 視角正規化
                 int pr = (state->player == 0) ? r : (BOARD_H - 1 - r);
                 int idx = pr * BOARD_W + c;
 
-                // [公式 V1]: 各種棋子數量差 (獨立計算 Piece Value)
-                self_score += PIECE_VALUES[sp];
-                
-                // [公式 V3]: 各種棋子的位置 (純 PST)
-                self_score += u3[sp][idx];
+                self_score += V1[sp];                // [公式 V1]: 訓練出來的基礎戰鬥力
+                self_official += V1_OFFICIAL[sp];    // 統計己方官方子力 (專供 V5)
+                self_score += V2[sp][idx];           // [公式 V2]: 絕對位置 PST
 
-                // [公式 V2]: 與敵方國王的曼哈頓距離 (國王 sp=6 本身不計算追殺)
-                if (sp < 6 && oppn_kr != -1) {
-                    int dist = manhattan(r, c, oppn_kr, oppn_kc);
-                    self_score += u2[sp - 1] * dist; 
-                }
-
-                // [公式 V5]: 漸進式升變指數 (剩 1~4 步)
-                if (sp == 1 && pr >= 1 && pr <= 4) {
-                    self_score += u5_pawn_stages[pr - 1];
-                }
-
-                // [公式 V6]: 當前步數 * 國王位置權重 (御駕親征)
                 if (sp == 6) {
-                    self_score += u7_king_step[idx] * safe_step;
+                    self_score += V6[idx] * std::pow(safe_step, v6_expo); // [公式 V6]: 國王親征
                 }
             }
             
-            // --- 幫敵方計算 (維持對稱性) ---
+            // --- 幫敵方計算 ---
             int op = oppn_board[r][c];
             if (op > 0) {
-                // 視角正規化 (敵方的底線是他的 0)
                 int opr = (state->player == 1) ? r : (BOARD_H - 1 - r);
                 int idx = opr * BOARD_W + c;
                 
-                // [公式 V1]
-                oppn_score += PIECE_VALUES[op];
+                oppn_score += V1[op];                // [公式 V1]: 訓練出來的基礎戰鬥力
+                oppn_official += V1_OFFICIAL[op];    // 統計敵方官方子力 (專供 V5)
+                oppn_score += V2[op][idx];           // [公式 V2]: 絕對位置 PST
 
-                // [公式 V3]
-                oppn_score += u3[op][idx];
-
-                // [公式 V2]
-                if (op < 6 && self_kr != -1) {
-                    int dist = manhattan(r, c, self_kr, self_kc);
-                    oppn_score += u2[op - 1] * dist;
-                }
-
-                // [公式 V5]
-                if (op == 1 && opr >= 1 && opr <= 4) {
-                    oppn_score += u5_pawn_stages[opr - 1];
-                }
-
-                // [公式 V6]
                 if (op == 6) {
-                    oppn_score += u7_king_step[idx] * safe_step;
+                    oppn_score += V6[idx] * std::pow(safe_step, v6_expo); // [公式 V6]: 國王親征
                 }
             }
         }
     }
 
-    int dynamic = 0;
+    // [公式 V5]: 百手結算判定
+    // 算式：極限獎懲分 * Tanh(常數 * 官方子力差) * (步數/100)^k
+    double v5_score = v5_time_scale * std::tanh(v5_tanh_c * (self_official - oppn_official)) * std::pow(safe_step / 100.0, v5_expo);
 
-    // 3. 動態探索區：對齊公式中的 V4 與 k1
+    double v3_score = 0;
+    double v4_score = 0;
+
     if (use_dyna) {
-        // 確保己方合法步生成完畢 (防呆)
         if (state->legal_actions.empty() && state->game_state == UNKNOWN) {
             state->get_legal_actions();
         }
 
         int self_tactical = 0;
         
-        // 掃描我方可以吃誰
         for (const auto& action : state->legal_actions) {
             int tr = action.second.first % BOARD_H;
             int tc = action.second.second;
-            int victim = oppn_board[tr][tc]; // 我方目標格上的敵子
+            int victim = oppn_board[tr][tc];
             if (victim > 0) {
-                self_tactical += u4_tactical[victim - 1];
+                self_tactical += V3[victim]; // [公式 V3]: 動態吃子威脅
             }
         }
         
-        // 生成敵方的盤面來算他們的機動力與戰術威脅
         State opp_state(state->board, 1 - state->player);
         opp_state.get_legal_actions();
         int oppn_tactical = 0;
         
-        // 掃描敵方可以吃誰
         for (const auto& action : opp_state.legal_actions) {
             int tr = action.second.first % BOARD_H;
             int tc = action.second.second;
             int victim = self_board[tr][tc];
             if (victim > 0) {
-                oppn_tactical += u4_tactical[victim - 1]; 
+                oppn_tactical += V3[victim]; // [公式 V3]: 動態吃子威脅
             }
         }
 
-        // [公式 V4]: 下一手吃子的步數權重差
-        dynamic += (self_tactical - oppn_tactical);
+        v3_score = (self_tactical - oppn_tactical);
+        
+        // [公式 V4]: 機動力差
+        v4_score = v4_mobility_weight * (static_cast<int>(state->legal_actions.size()) - static_cast<int>(opp_state.legal_actions.size())); 
     }
 
-    // 結算：基礎常數 + 靜態雙方差距 + 動態威脅差距
-    return u_intercept + (self_score - oppn_score) + dynamic;
+    // 結算：常數 + 靜態戰鬥力 + V5結算防禦 + 動態威脅 + 機動力
+    return v_intercept + static_cast<int>(self_score - oppn_score + v5_score + v3_score + v4_score);
 }
 
 // ==============================================================================
@@ -262,7 +223,7 @@ int Policy::q_search(State *state, GameHistory& history, int ply, SearchContext&
     }
     
     if(state->game_state == WIN) return P_MAX - ply; 
-    if(state->game_state == DRAW) return 0;
+    if(state->game_state == DRAW) return -20;
 
     int opp = 1 - state->player;
     std::vector<Move> wt;
@@ -310,7 +271,7 @@ int Policy::eval_ctx(State *state, int depth, GameHistory& history, int ply, Sea
     // 結束了？結束了。
     if(state->legal_actions.empty() && state->game_state == UNKNOWN) state->get_legal_actions();
     if(state->game_state == WIN) return P_MAX - ply; 
-    if(state->game_state == DRAW) return 0;
+    if(state->game_state == DRAW) return -20;
 
 
     // 不是葉節點，且深度夠淺 (通常 RFP 只對剩餘深度 3 以內的分支有效)
@@ -320,7 +281,7 @@ int Policy::eval_ctx(State *state, int depth, GameHistory& history, int ply, Sea
         int static_eval = custom_evaluate(state); 
         
         // 設定容錯值 (Margin)：每深 1 層，給予約 1 顆小兵的容錯空間
-        int margin = 1.2 * PIECE_VALUES[1] * depth; 
+        int margin = 1.2 * V1[1] * depth; 
 
         // 如果我方優勢大到「即使少走一步 (減去 margin)，對手依然無法打破 beta 邊界」
         if (static_eval - margin >= beta) {
